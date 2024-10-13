@@ -13,6 +13,9 @@
 #include <QMessageBox>
 #include <QTimer>
 #include <QSet>
+#include <QRegularExpression>
+#include <QScrollBar>
+#include <qDebug>
 
 class DDImageWriter : public QWidget {
     Q_OBJECT
@@ -29,6 +32,8 @@ private slots:
 
 private:
     void populateDrives();
+    QString getDiskForVolume(const QString &volumePath);
+    void executeDD(const QString &ddCommand);
 
     QComboBox *driveComboBox;
     QComboBox *bsComboBox;
@@ -65,6 +70,14 @@ DDImageWriter::DDImageWriter(QWidget *parent)
     // Connect process signals
     connect(ddProcess, &QProcess::readyReadStandardOutput, this, &DDImageWriter::onDDOutput);
     connect(ddProcess, &QProcess::readyReadStandardError, this, &DDImageWriter::onDDError);
+    connect(ddProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            [=](int exitCode, QProcess::ExitStatus exitStatus){
+        if(exitStatus == QProcess::CrashExit){
+            outputTextEdit->append("Process crashed.");
+        } else {
+            outputTextEdit->append(QString("Process finished with exit code %1").arg(exitCode));
+        }
+    });
 
     // Set up the timer to scan for drives every 5 seconds
     connect(driveScanTimer, &QTimer::timeout, this, &DDImageWriter::scanForDrives);
@@ -93,22 +106,39 @@ DDImageWriter::DDImageWriter(QWidget *parent)
     mainLayout->addLayout(bsLayout);
     mainLayout->addLayout(imageFileLayout);
     mainLayout->addWidget(startButton);
+    mainLayout->addWidget(new QLabel("Output:", this));
     mainLayout->addWidget(outputTextEdit);
 
     setLayout(mainLayout);
+    setWindowTitle("DD Image Writer");
+    resize(600, 400);
 }
 
 void DDImageWriter::populateDrives() {
     driveComboBox->clear();
     currentDrives.clear();
 
-    // List available storage drives and exclude root drive "/"
+    // List available storage drives and exclude root drive "/dev/disk0"
     foreach (const QStorageInfo &storage, QStorageInfo::mountedVolumes()) {
         if (storage.isValid() && storage.isReady() && storage.rootPath() != "/") {
-            QString drivePath = storage.rootPath();
-            QString driveDescription = QString("%1 (%2)").arg(storage.displayName(), drivePath);
-            driveComboBox->addItem(driveDescription, drivePath);
-            currentDrives.insert(drivePath);
+            qDebug() << storage.displayName();
+
+            QString volumePath = storage.rootPath();
+            QString diskPath = storage.device();
+qDebug() << volumePath << diskPath << storage.device() ;
+QRegularExpression re("(/dev/disk\\d+)(s\\d+)?");
+QRegularExpressionMatch match = re.match(diskPath);
+QString baseDiskName;
+if (match.hasMatch()) {
+    baseDiskName = match.captured(1); // This captures /dev/diskX
+  //  baseDiskName.remove("/dev/");      // Remove "/dev/" to get "diskX"
+}
+            // Only add valid /dev/disk entries (exclude /dev/disk0)
+            if (!diskPath.isEmpty() && !diskPath.contains("/dev/disk0")) {
+                QString driveDescription = QString("%1 (%2)").arg(baseDiskName, volumePath);
+                driveComboBox->addItem(driveDescription, baseDiskName);
+                currentDrives.insert(diskPath);
+            }
         }
     }
 
@@ -123,13 +153,23 @@ void DDImageWriter::scanForDrives() {
 
     foreach (const QStorageInfo &storage, QStorageInfo::mountedVolumes()) {
         if (storage.isValid() && storage.isReady() && storage.rootPath() != "/") {
-            QString drivePath = storage.rootPath();
-            newDrives.insert(drivePath);
-            if (!currentDrives.contains(drivePath)) {
-                // New drive detected
-                QString driveDescription = QString("%1 (%2)").arg(storage.displayName(), drivePath);
-                driveComboBox->addItem(driveDescription, drivePath);
-                outputTextEdit->append("Drive connected: " + driveDescription);
+            QString volumePath = storage.rootPath();
+            QString diskPath = storage.device();
+            QRegularExpression re("(/dev/disk\\d+)(s\\d+)?");
+            QRegularExpressionMatch match = re.match(diskPath);
+            QString baseDiskName;
+            if (match.hasMatch()) {
+                baseDiskName = match.captured(1); // This captures /dev/diskX
+             //   baseDiskName.remove("/dev/");      // Remove "/dev/" to get "diskX"
+            }
+            if (!diskPath.isEmpty() && !diskPath.contains("/dev/disk0")) {
+                newDrives.insert(baseDiskName);
+                if (!currentDrives.contains(baseDiskName)) {
+                    // New drive detected
+                    QString driveDescription = QString("%1 (%2)").arg(baseDiskName, volumePath);
+                    driveComboBox->addItem(driveDescription, baseDiskName);
+                    outputTextEdit->append("Drive connected: " + driveDescription);
+                }
             }
         }
     }
@@ -157,6 +197,24 @@ void DDImageWriter::scanForDrives() {
     }
 }
 
+QString DDImageWriter::getDiskForVolume(const QString &volumePath) {
+    // Execute diskutil info for the given volumePath to get the device node
+    QProcess diskutilProcess;
+    diskutilProcess.start("diskutil", QStringList() << "info" << volumePath);
+    diskutilProcess.waitForFinished();
+
+    QString output = diskutilProcess.readAllStandardOutput();
+
+    // Use regex to find the "Device Node" line
+    QRegularExpression re(QStringLiteral("^\\s*Device Node:\\s+(\\/dev\\/disk\\d+)"));
+    QRegularExpressionMatch match = re.match(output);
+    if (match.hasMatch()) {
+        return match.captured(1);
+    }
+
+    return ""; // Return empty string if no match is found
+}
+
 void DDImageWriter::selectImageFile() {
     QString fileName = QFileDialog::getOpenFileName(this, "Select Image File", "", "Disk Images (*.img *.iso)");
     if (!fileName.isEmpty()) {
@@ -166,42 +224,73 @@ void DDImageWriter::selectImageFile() {
 
 void DDImageWriter::startDDProcess() {
     QString drive = driveComboBox->currentData().toString();
-    QString bs = bsComboBox->currentText();
+    QString blockSize = bsComboBox->currentText();
     QString imageFile = imageFileLineEdit->text();
 
-    if (drive.isEmpty() || imageFile.isEmpty() || drive == "/") {
+    if (drive.isEmpty() || imageFile.isEmpty()) {
         QMessageBox::warning(this, "Input Error", "Please select both a valid drive and an image file.");
         return;
     }
 
-    // Use osascript with do shell script for secure password handling on macOS
-    QString ddCommand = QString("dd if='%1' of='%2' bs=%3 status=progress").arg(imageFile, drive, bs);
+    // Confirm the operation
+    QMessageBox::StandardButton reply;
+    reply = QMessageBox::question(this, "Confirm Operation",
+                                  QString("Are you sure you want to write the image to %1?\nThis will erase all data on the drive.")
+                                      .arg(drive),
+                                  QMessageBox::Yes | QMessageBox::No);
+    if (reply != QMessageBox::Yes) {
+        return;
+    }
 
-    // Construct the osascript command to execute dd with administrator privileges
-    QString osascriptCommand = QString(R"(
-        /usr/bin/osascript -e 'do shell script "%1" with administrator privileges'
-    )").arg(ddCommand.replace("\"", "\\\"")); // Escape double quotes
+    // Construct the dd command
+    QString ddCommand = QString("sudo dd if=\"%1\" of=\"%2\" bs=%3 status=progress").arg(imageFile, drive, blockSize);
 
+    // Use osascript to execute the dd command with administrator privileges
+    QString osascriptCommand = QString("do shell script \"%1\" with administrator privileges").arg(ddCommand.replace("\"", "\\\""));
+
+    executeDD(osascriptCommand);
+}
+
+void DDImageWriter::executeDD(const QString &ddCommand) {
+    // Clear previous output
     outputTextEdit->append("Executing: " + ddCommand);
-    ddProcess->start("bash", QStringList() << "-c" << osascriptCommand);
+
+    // Use osascript to run the dd command with admin privileges
+    QString fullCommand = QString("osascript -e '%1'").arg(ddCommand);
+
+    // Start the process
+    ddProcess->start("bash", QStringList() << "-c" << fullCommand);
+
+    if (!ddProcess->waitForStarted()) {
+        QMessageBox::critical(this, "Error", "Failed to start the dd process.");
+        return;
+    }
 }
 
 void DDImageWriter::onDDOutput() {
     QString output = ddProcess->readAllStandardOutput();
-    outputTextEdit->append(output);
+    if (!output.isEmpty()) {
+        outputTextEdit->append(output.trimmed());
+        // Auto-scroll to the bottom
+        QScrollBar *bar = outputTextEdit->verticalScrollBar();
+        bar->setValue(bar->maximum());
+    }
 }
 
 void DDImageWriter::onDDError() {
     QString errorOutput = ddProcess->readAllStandardError();
-    outputTextEdit->append("Error: " + errorOutput);
+    if (!errorOutput.isEmpty()) {
+        outputTextEdit->append("<span style='color:red;'>Error: " + errorOutput.trimmed() + "</span>");
+        // Auto-scroll to the bottom
+        QScrollBar *bar = outputTextEdit->verticalScrollBar();
+        bar->setValue(bar->maximum());
+    }
 }
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
 
     DDImageWriter window;
-    window.setWindowTitle("DD Image Writer");
-    window.resize(600, 400);
     window.show();
 
     return app.exec();
