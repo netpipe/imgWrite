@@ -32,7 +32,6 @@ private slots:
 
 private:
     void populateDrives();
-    QString getDiskForVolume(const QString &volumePath);
     void executeDD(const QString &ddCommand);
 
     QComboBox *driveComboBox;
@@ -197,28 +196,76 @@ void DDImageWriter::scanForDrives() {
     }
 }
 
-QString DDImageWriter::getDiskForVolume(const QString &volumePath) {
-    // Execute diskutil info for the given volumePath to get the device node
-    QProcess diskutilProcess;
-    diskutilProcess.start("diskutil", QStringList() << "info" << volumePath);
-    diskutilProcess.waitForFinished();
-
-    QString output = diskutilProcess.readAllStandardOutput();
-
-    // Use regex to find the "Device Node" line
-    QRegularExpression re(QStringLiteral("^\\s*Device Node:\\s+(\\/dev\\/disk\\d+)"));
-    QRegularExpressionMatch match = re.match(output);
-    if (match.hasMatch()) {
-        return match.captured(1);
-    }
-
-    return ""; // Return empty string if no match is found
-}
-
 void DDImageWriter::selectImageFile() {
     QString fileName = QFileDialog::getOpenFileName(this, "Select Image File", "", "Disk Images (*.img *.iso)");
     if (!fileName.isEmpty()) {
         imageFileLineEdit->setText(fileName);
+    }
+}
+#include <QProcess>
+#include <QFile>
+#include <QTextStream>
+#include <QDebug>
+
+void writeDDImage(const QString& inputFile, const QString& outputDevice, const QString& blockSize) {
+    // Step 1: Unmount the target disk using diskutil
+    QString unmountCommand = QString("diskutil unmountDisk %1").arg(outputDevice);
+    QProcess unmountProcess;
+    unmountProcess.start("bash", QStringList() << "-c" << unmountCommand);
+    unmountProcess.waitForFinished();
+
+    QString unmountOutput = unmountProcess.readAllStandardOutput();
+    QString unmountError = unmountProcess.readAllStandardError();
+
+    if (!unmountError.isEmpty()) {
+        qDebug() << "Unmount error:" << unmountError;
+        return;
+    } else {
+        qDebug() << "Unmount successful:" << unmountOutput;
+    }
+
+    // Step 2: Prompt for password using osascript
+    QProcess passwordProcess;
+    QString osascriptCommand = R"(
+        osascript -e 'display dialog "Enter your password" with hidden answer default answer ""' \
+                  -e 'text returned of result'
+    )";
+
+    passwordProcess.start("bash", QStringList() << "-c" << osascriptCommand);
+    passwordProcess.waitForFinished();
+
+    QString password = passwordProcess.readAllStandardOutput().trimmed();
+    if (password.isEmpty()) {
+        qDebug() << "No password entered!";
+        return;
+    }
+
+    // Step 3: Execute dd command directly using sudo and pass the password
+    QProcess process;
+    process.setProcessChannelMode(QProcess::MergedChannels);  // Merge stdout and stderr
+
+    // Construct the dd command directly in sudo
+    QString ddCommand = QString("dd if='%1' of='%2' bs=%3").arg(inputFile).arg(outputDevice).arg(blockSize);
+
+    // Start the process using sudo to run the dd command
+    process.start("sudo", QStringList() << "-S" << "bash" << "-c" << ddCommand);
+
+    // Write the password into the process for sudo
+    process.write((password + "\n").toLocal8Bit());
+    process.closeWriteChannel();  // Close the write channel after sending the password
+
+    // Wait for the process to finish
+    process.waitForFinished(-1);  // Wait indefinitely for dd to complete
+
+    // Capture the output and error messages
+    QString output = process.readAllStandardOutput();
+    QString error = process.readAllStandardError();
+
+    // Check if any errors occurred
+    if (!error.isEmpty()) {
+        qDebug() << "Error:" << error;
+    } else {
+        qDebug() << "Output:" << output;
     }
 }
 
@@ -243,12 +290,14 @@ void DDImageWriter::startDDProcess() {
     }
 
     // Construct the dd command
-    QString ddCommand = QString("sudo dd if=\"%1\" of=\"%2\" bs=%3 status=progress").arg(imageFile, drive, blockSize);
+   // QString ddCommand = QString("dd if=\"%1\" of=\"%2\" bs=%3").arg(imageFile, drive, blockSize);
+    writeDDImage(imageFile, drive, blockSize);
+
 
     // Use osascript to execute the dd command with administrator privileges
-    QString osascriptCommand = QString("do shell script \"%1\" with administrator privileges").arg(ddCommand.replace("\"", "\\\""));
+   // QString osascriptCommand = QString("do shell script \"%1\" with administrator privileges").arg(ddCommand.replace("\"", "\\\""));
 
-    executeDD(osascriptCommand);
+   // executeDD(osascriptCommand);
 }
 
 void DDImageWriter::executeDD(const QString &ddCommand) {

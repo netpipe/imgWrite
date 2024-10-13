@@ -1,6 +1,6 @@
 QT += gui core widgets multimedia
 
-TARGET = voiceChanger
+TARGET = imgWrite
 TEMPLATE = app
 
 CONFIG += c++17
@@ -9,8 +9,7 @@ SOURCES += main.cpp
 
 HEADERS +=
 
-INCLUDEPATH += /Users/macbook2015/Desktop/brew/include/soundtouch
+INCLUDEPATH +=
 
-
-LIBS += -L/Users/macbook2015/Desktop/brew/lib -lsoundtouch
+LIBS +=
 
